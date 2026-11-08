@@ -1,0 +1,105 @@
+# Uptime check from outside: SAMS cannot report its own outage when the server (or the hosting, DNS or SSL
+# certificate) is down, so GitHub checks it every 5 minutes.
+#
+#   - API:      https://lms.cloudratics.com/api/health must answer "status": "ok" with the database "ok"
+#   - Website:  https://sams.cloudratics.com/login must load
+#   - Demo:     https://lms.cloudratics.com/api/demo/public/environment must answer
+#
+# A check that fails 3 times in a row opens a GitHub issue labelled "outage": GitHub e-mails you and notifies the
+# GitHub mobile app (Settings → Notifications → "Issues" for this repository; you are watching your own repository).
+# When SAMS answers again, the issue gets a comment with how long it was down and is closed (another e-mail).
+#
+# Change the addresses below (env) if yours differ. Free on a public repository. On a PRIVATE one each run counts
+# as 1 minute of the 2,000 free Actions minutes a month: every 5 minutes would use ~8,600, so either change the cron
+# below to "*/30 * * * *" (~1,450 a month), or (better) put only this file in a small separate PUBLIC repository
+# (e.g. "sams-status": it contains no SAMS code, only these public addresses) and keep every 5 minutes for free.
+# The pings also keep the app awake at night, so the 02:30 backup always runs.
+name: Uptime check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # GitHub may run it a few minutes late when it is busy
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+env:
+  API_HEALTH: https://lms.cloudratics.com/api/health
+  WEBSITE: https://sams.cloudratics.com/login
+  DEMO: https://lms.cloudratics.com/api/demo/public/environment
+  SLOW_SECONDS: "10"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check SAMS
+        id: check
+        run: |
+          problems=""
+          probe() { # name url kind
+            local name="$1" url="$2" kind="$3" body code time ok=""
+            for attempt in 1 2 3; do
+              rm -f /tmp/body /tmp/err
+              body=$(curl -sS -m 20 -A "SAMS-uptime-check" -o /tmp/body -w '%{http_code} %{time_total}' "$url" 2>/tmp/err) || true
+              code=${body%% *}; time=${body##* }
+              case "$kind" in
+                health) grep -q '"status":"ok"' /tmp/body 2>/dev/null && grep -q '"database":"ok"' /tmp/body && ok=1 ;;
+                page)   [ "$code" = "200" ] && grep -qi '<div id="root"' /tmp/body && ok=1 ;;
+                json)   [ "$code" = "200" ] && ok=1 ;;
+              esac
+              if [ -n "$ok" ] && awk "BEGIN{exit !($time < $SLOW_SECONDS)}"; then
+                echo "✅ $name: HTTP $code in ${time}s" >> "$GITHUB_STEP_SUMMARY"; return 0
+              fi
+              [ -n "$ok" ] && reason="answered, but took ${time}s" || reason="HTTP ${code:-none} $(head -c 160 /tmp/body 2>/dev/null | tr -d '\n') $(head -c 160 /tmp/err 2>/dev/null)"
+              [ $attempt -lt 3 ] && sleep 20
+            done
+            echo "❌ $name ($url): $reason" >> "$GITHUB_STEP_SUMMARY"
+            problems="${problems}- **${name}** (${url}): ${reason}"$'\n'
+          }
+          probe "API" "$API_HEALTH" health
+          probe "Website" "$WEBSITE" page
+          probe "Demo" "$DEMO" json
+          {
+            echo "problems<<EOF"
+            printf '%s' "$problems"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the outage issue
+        if: steps.check.outputs.problems != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBLEMS: ${{ steps.check.outputs.problems }}
+        run: |
+          gh label create outage --color B60205 --description "SAMS could not be reached" -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label outage --state open --json number --jq '.[0].number')
+          now=$(TZ=Asia/Karachi date '+%d %b %Y %H:%M PKT')
+          if [ -z "$open" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --label outage --title "🔴 SAMS is down (since $now)" --body "$(printf 'The uptime check could not reach SAMS (3 tries, 20 s apart):\n\n%s\nFirst failed: %s.\n\nWhat to check: hPanel → Websites → the Node.js app (is it running? restart it), the database in hPanel, the SSL certificate and the domain. This issue closes itself when SAMS answers again.' "$PROBLEMS" "$now")"
+          else
+            # one comment an hour while it stays down, not one every 5 minutes
+            last=$(gh issue view "$open" -R "$GITHUB_REPOSITORY" --json comments,createdAt --jq '(.comments | last | .createdAt) // .createdAt')
+            if [ $(( $(date +%s) - $(date -d "$last" +%s) )) -gt 3300 ]; then
+              gh issue comment "$open" -R "$GITHUB_REPOSITORY" --body "$(printf 'Still down at %s:\n\n%s' "$now" "$PROBLEMS")"
+            fi
+          fi
+
+      - name: Close the outage issue when SAMS is back
+        if: steps.check.outputs.problems == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label outage --state open --json number,createdAt --jq '.[0] | "\(.number) \(.createdAt)"' 2>/dev/null || true)
+          [ -z "$open" ] || [ "$open" = "null null" ] && exit 0
+          num=${open%% *}; since=${open#* }
+          mins=$(( ( $(date +%s) - $(date -d "$since" +%s) ) / 60 ))
+          gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body "✅ SAMS answers again ($(TZ=Asia/Karachi date '+%d %b %Y %H:%M PKT')). It was down for about $mins minutes (counting from the first failed check)."
+          gh issue close "$num" -R "$GITHUB_REPOSITORY"
